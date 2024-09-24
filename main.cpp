@@ -1,5 +1,5 @@
 #include <winsock2.h>
-#include <ws2tcpip.h>  // 添加此行以包含 inet_pton
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -13,23 +13,31 @@
 #include <thread>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Ws2_32.lib")
 
 #define MAX_PACKET_SIZE 65535
-constexpr const char* PROXY_ADDRESS = "127.0.0.1";
+constexpr const char* PROXY_ADDRESS = "192.168.3.91";
 constexpr int PROXY_PORT = 7890;
 
 std::queue<std::pair<std::vector<char>, UINT>> packet_queue;
 std::mutex queue_mutex;
 std::condition_variable queue_cond;
 DWORD target_pid = 0;
-int ports[50];
-int port_count = 0;
 WINDIVERT_ADDRESS global_addr;
 
-void modify_packet_and_redirect(char* packet, UINT packet_len, WINDIVERT_ADDRESS addr);
+// 用于存储流信息
+struct FlowInfo {
+    UINT32 original_ip;
+    UINT16 original_port;
+};
+
+std::unordered_map<UINT32, FlowInfo> flow_map;
+std::mutex flow_map_mutex;
+
+void modify_packet_and_redirect(char* packet, UINT packet_len, WINDIVERT_ADDRESS addr, bool is_response);
 DWORD GetProcessIdByName(const wchar_t* process_name);
 void GetTcpConnections(DWORD target_pid, int* ports, int* port_count);
 void AsyncGetPidAndPorts(const wchar_t* process_name);
@@ -44,8 +52,7 @@ int main() {
     // 启动数据包处理线程
     std::thread packet_thread(PacketProcessingThread);
 
-    HANDLE handle;
-    handle = WinDivertOpen("true", WINDIVERT_LAYER_NETWORK, 0, 0); // 使用 "true" 作为过滤器
+    HANDLE handle = WinDivertOpen("true", WINDIVERT_LAYER_NETWORK, 0, 0); // 使用 "true" 作为过滤器
     if (handle == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Error: Failed to open WinDivert handle (%d)\n", GetLastError());
         return EXIT_FAILURE;
@@ -69,12 +76,12 @@ int main() {
     }
 
     WinDivertClose(handle);
-    pid_thread.detach();
-    packet_thread.detach();
+    pid_thread.join();
+    packet_thread.join();
     return 0;
 }
 
-void modify_packet_and_redirect(char* packet, UINT packet_len, WINDIVERT_ADDRESS addr) {
+void modify_packet_and_redirect(char* packet, UINT packet_len, WINDIVERT_ADDRESS addr, bool is_response) {
     PWINDIVERT_IPHDR ip_header = nullptr;
     PWINDIVERT_IPV6HDR ipv6_header = nullptr;
     UINT8 protocol;
@@ -108,17 +115,36 @@ void modify_packet_and_redirect(char* packet, UINT packet_len, WINDIVERT_ADDRESS
         return;  // 如果解析失败，直接返回
     }
 
-    // 修改目标 IP 地址和端口
-    struct in_addr proxy_addr;
-    if (inet_pton(AF_INET, PROXY_ADDRESS, &proxy_addr) == 1) {
-        ip_header->DstAddr = proxy_addr.S_un.S_addr;
-        tcp_header->DstPort = htons(PROXY_PORT);
+    std::lock_guard<std::mutex> lock(flow_map_mutex);
 
-        // 重新计算校验和
-        WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0); // flags 参数传递为 0
+    if (!is_response) {
+        // 请求包：修改目标 IP 地址和端口，保存映射关系
+        struct in_addr proxy_addr;
+        if (inet_pton(AF_INET, PROXY_ADDRESS, &proxy_addr) == 1) {
+            flow_map[ntohl(ip_header->SrcAddr)] = { ip_header->DstAddr, ntohs(tcp_header->DstPort) };
+            ip_header->DstAddr = proxy_addr.S_un.S_addr; // 修改目标地址
+            tcp_header->DstPort = htons(PROXY_PORT); // 修改目标端口
+
+            // 重新计算校验和
+            WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
+        }
+        else {
+            fprintf(stderr, "Error: Invalid proxy address\n");
+        }
     }
     else {
-        fprintf(stderr, "Error: Invalid proxy address\n");
+        // 响应包：查找原始客户端的 IP 和端口，并恢复
+        auto it = flow_map.find(ntohl(ip_header->DstAddr));
+        if (it != flow_map.end()) {
+            ip_header->SrcAddr = htonl(it->second.original_ip);
+            tcp_header->SrcPort = htons(it->second.original_port);
+
+            // 重新计算校验和
+            WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
+        }
+        else {
+            fprintf(stderr, "Warning: No matching flow found for response packet\n");
+        }
     }
 }
 
@@ -172,6 +198,8 @@ void AsyncGetPidAndPorts(const wchar_t* process_name) {
         DWORD pid = GetProcessIdByName(process_name);
         if (pid != 0 && pid != target_pid) {
             target_pid = pid;
+            int ports[50];
+            int port_count = 0;
             GetTcpConnections(target_pid, ports, &port_count);
         }
         Sleep(5000);  // 定期刷新 PID 和端口信息
@@ -179,6 +207,12 @@ void AsyncGetPidAndPorts(const wchar_t* process_name) {
 }
 
 void PacketProcessingThread() {
+    HANDLE handle = WinDivertOpen("true", WINDIVERT_LAYER_NETWORK, 0, 0); // 打开一个新的 WinDivert 句柄
+    if (handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Error: Failed to open WinDivert handle (%d)\n", GetLastError());
+        return;
+    }
+
     while (TRUE) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         queue_cond.wait(lock, [] { return !packet_queue.empty(); });
@@ -189,9 +223,25 @@ void PacketProcessingThread() {
             lock.unlock();
 
             // 处理捕获的数据包
-            modify_packet_and_redirect(packet_info.first.data(), packet_info.second, global_addr);
+            modify_packet_and_redirect(packet_info.first.data(), packet_info.second, global_addr, false);
+
+            // 发送修改后的数据包到代理服务器
+            if (!WinDivertSend(handle, packet_info.first.data(), packet_info.second, nullptr, &global_addr)) {
+                fprintf(stderr, "Warning: Failed to send packet (%d)\n", GetLastError());
+            }
+
+            // 接收来自代理的响应
+            std::vector<char> response_packet(MAX_PACKET_SIZE);
+            UINT response_len;
+            if (WinDivertRecv(handle, response_packet.data(), response_packet.size(), &response_len, &global_addr)) {
+                // 修改响应包并转发给原应用
+                modify_packet_and_redirect(response_packet.data(), response_len, global_addr, true);
+                WinDivertSend(handle, response_packet.data(), response_len, nullptr, &global_addr);
+            }
 
             lock.lock();
         }
     }
+
+    WinDivertClose(handle); // 确保在退出前关闭句柄
 }
